@@ -1,0 +1,929 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no"/>
+  <title>Right of Way (Mobile)</title>
+  <style>
+    html, body {
+      margin:0; height:100%; background:#0b0f14; color:#e7eef7;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      overflow:hidden;
+      touch-action:none;
+    }
+    #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+    canvas { background:#000; border:1px solid rgba(231,238,247,.18); border-radius:12px; display:block; }
+    .hud {
+      position:fixed; left:0; right:0; top:0; padding:10px 12px;
+      display:flex; gap:10px; justify-content:space-between; align-items:center;
+      pointer-events:none;
+    }
+    .pill {
+      pointer-events:none;
+      background: rgba(5,10,16,0.55);
+      border: 1px solid rgba(241,246,255,0.16);
+      border-radius: 999px;
+      padding: 8px 10px;
+      font-size: 12px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .controls {
+      position:fixed; left:0; right:0; bottom:0; padding:14px 14px 18px;
+      display:flex; justify-content:space-between; align-items:flex-end; gap:12px;
+      pointer-events:none;
+    }
+    .btn {
+      pointer-events:auto;
+      user-select:none;
+      -webkit-user-select:none;
+      touch-action:none;
+      width: 96px; height: 56px;
+      border-radius: 14px;
+      background: rgba(5,10,16,0.55);
+      border: 1px solid rgba(241,246,255,0.18);
+      color: #f1f6ff;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      display:flex; align-items:center; justify-content:center;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+    }
+    .btn:active { transform: scale(0.98); }
+    .tip {
+      position:fixed; left:12px; right:12px; bottom:86px;
+      font-size: 12px; opacity: 0.78; text-align:center;
+      pointer-events:none;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.35);
+    }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+</div>
+
+<div class="hud">
+  <div class="pill" id="hudLeft">Right of Way</div>
+  <div class="pill" id="hudRight">Drag to move • Tap FIRE</div>
+</div>
+
+<div class="tip" id="tip">One finger drag to move. Tap FIRE or quick tap to shoot. Two-finger tap also shoots.</div>
+
+<div class="controls">
+  <div class="btn" id="pauseBtn">PAUSE</div>
+  <div class="btn" id="fireBtn">FIRE</div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const hudLeft = document.getElementById("hudLeft");
+  const hudRight = document.getElementById("hudRight");
+  const tip = document.getElementById("tip");
+  const fireBtn = document.getElementById("fireBtn");
+  const pauseBtn = document.getElementById("pauseBtn");
+
+  // Base logical game resolution (scaled to screen)
+  const BASE_W = 900, BASE_H = 600;
+
+  // Fit canvas to screen while preserving aspect
+  let viewW = BASE_W, viewH = BASE_H, scale = 1, offsetX = 0, offsetY = 0;
+
+  function fitCanvas() {
+    const dpr = Math.max(1, Math.min(2.5, window.devicePixelRatio || 1));
+    const sw = window.innerWidth;
+    const sh = window.innerHeight;
+
+    // Leave space for control overlays
+    const safeTop = 52;
+    const safeBottom = 92;
+    const availW = sw;
+    const availH = Math.max(200, sh - safeTop - safeBottom);
+
+    const targetAspect = BASE_W / BASE_H;
+    let cw = availW, ch = availH;
+    if (cw / ch > targetAspect) cw = ch * targetAspect;
+    else ch = cw / targetAspect;
+
+    viewW = Math.floor(cw);
+    viewH = Math.floor(ch);
+    scale = viewW / BASE_W;
+
+    canvas.style.width = viewW + "px";
+    canvas.style.height = viewH + "px";
+    canvas.width = Math.floor(viewW * dpr);
+    canvas.height = Math.floor(viewH * dpr);
+
+    // map logical to rendered
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+
+    // center canvas
+    offsetX = (sw - viewW) / 2;
+    offsetY = (sh - safeTop - safeBottom - viewH) / 2 + safeTop;
+    canvas.style.position = "absolute";
+    canvas.style.left = offsetX + "px";
+    canvas.style.top = offsetY + "px";
+  }
+  fitCanvas();
+  window.addEventListener("resize", fitCanvas);
+
+  const W = BASE_W, H = BASE_H;
+
+  // Palette
+  const COL = {
+    ui: "#f1f6ff",
+    uiMuted: "rgba(241,246,255,0.72)",
+    panel: "rgba(5,10,16,0.55)",
+    outline: "rgba(241,246,255,0.18)",
+    bullet: "#ffd166",
+    player: "#3be4c5",
+    danger: "#ff4d6d",
+    convoy: "#2f7cff",
+    convoyHead: "#6aa6ff",
+    shadow: "rgba(0,0,0,0.25)",
+    house: "#ffd7a8",
+    house2: "#ffb38a",
+    house3: "#ff8d6b",
+  };
+
+  // Audio
+  let audioCtx = null;
+  let muted = false;
+  function beep(freq=440, dur=0.05, vol=0.04, type="square") {
+    if (muted) return;
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = type;
+      o.frequency.value = freq;
+      g.gain.value = vol;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start();
+      o.stop(audioCtx.currentTime + dur);
+    } catch {}
+  }
+
+  // Helpers
+  const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+  const rand = (a,b) => a + Math.random() * (b-a);
+  function rectHit(ax,ay,aw,ah, bx,by,bw,bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  // Keyboard support (desktop)
+  const keys = new Set();
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    keys.add(k === " " ? "space" : k);
+    if (k === "p") togglePause();
+    if (k === "r") reset();
+    if (k === "m") { muted = !muted; beep(muted ? 180 : 720, 0.06, 0.05, "square"); }
+    if (["arrowup","arrowdown"," "].includes(e.key)) e.preventDefault();
+  });
+  window.addEventListener("keyup", (e) => {
+    const k = e.key.toLowerCase();
+    keys.delete(k === " " ? "space" : k);
+  });
+
+  // Touch controls
+  let touchActive = false;
+  let touchX = W/2;              // desired player x
+  let lastTapTime = 0;
+  let fireHeld = false;
+
+  function screenToGame(clientX, clientY) {
+    // translate from screen pixels to game logical coords
+    const xOnCanvas = clientX - offsetX;
+    const yOnCanvas = clientY - offsetY;
+    const gx = xOnCanvas / scale;
+    const gy = yOnCanvas / scale;
+    return { x: gx, y: gy };
+  }
+
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    const p = screenToGame(e.clientX, e.clientY);
+
+    // Quick tap in bottom area triggers fire (optional)
+    const now = performance.now();
+    const isQuickTap = (now - lastTapTime) < 260;
+    lastTapTime = now;
+
+    touchActive = true;
+    touchX = clamp(p.x, 24, W-24);
+
+    // If they double-tap or tap near bottom, fire
+    if (p.y > H * 0.70 || isQuickTap) fireHeld = true;
+  }, { passive:false });
+
+  canvas.addEventListener("pointermove", (e) => {
+    if (!touchActive) return;
+    const p = screenToGame(e.clientX, e.clientY);
+    touchX = clamp(p.x, 24, W-24);
+  }, { passive:false });
+
+  canvas.addEventListener("pointerup", () => {
+    touchActive = false;
+    fireHeld = false;
+  }, { passive:false });
+
+  // Two-finger tap anywhere to fire
+  window.addEventListener("touchstart", (e) => {
+    if (e.touches && e.touches.length >= 2) {
+      fireHeld = true;
+      setTimeout(() => (fireHeld = false), 110);
+    }
+  }, { passive:true });
+
+  // On-screen buttons
+  fireBtn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    fireHeld = true;
+    setTimeout(() => (fireHeld = false), 120);
+  });
+  pauseBtn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    togglePause();
+  });
+
+  // Game tuning
+  const laneSize = 30;
+  const topMargin = 70;
+  const bottomMargin = 70;
+
+  const bullets = [];
+  const particles = [];
+  const homes = [];
+  const homeSize = 26;
+  const HOME_HP_MAX = 3;
+
+  let convoy = [];
+  let convoyDir = 1;
+  let convoyStepTimer = 0;
+
+  const spider = {
+    active: false,
+    x: 0, y: 0,
+    vx: 0, vy: 0,
+    r: 14,
+    spawnTimer: 0,
+    nextSpawnIn: 4,
+  };
+
+  const player = {
+    w: 36, h: 18,
+    x: W/2, y: H - 45,
+    speed: 440,
+    cooldown: 0,
+  };
+
+  // Background cache
+  let bgCanvas = null;
+  function makeOffscreen(w, h, drawFn) {
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const g = c.getContext("2d");
+    drawFn(g, w, h);
+    return c;
+  }
+
+  function buildBackdrop() {
+    bgCanvas = makeOffscreen(W, H, (g,w,h) => {
+      // Sky
+      const sky = g.createLinearGradient(0,0,0,h);
+      sky.addColorStop(0, "#c9f0ff");
+      sky.addColorStop(0.35, "#7fd1ff");
+      sky.addColorStop(0.7, "#4e9cff");
+      sky.addColorStop(1, "#2a5fbe");
+      g.fillStyle = sky; g.fillRect(0,0,w,h);
+
+      // Haze
+      g.globalAlpha = 0.18; g.fillStyle="#fff"; g.fillRect(0,120,w,110);
+      g.globalAlpha = 1;
+
+      // Skyline
+      const baseY = 175;
+      g.fillStyle = "rgba(16,35,70,0.55)";
+      for (let i=0;i<75;i++){
+        const bw = Math.floor(rand(14,46));
+        const bh = Math.floor(rand(18,110));
+        const bx = Math.floor(rand(-20,w+20));
+        const by = baseY - bh + Math.floor(rand(-8,8));
+        g.fillRect(bx,by,bw,bh);
+      }
+
+      // Highway
+      const hy = 205;
+      g.fillStyle = "rgba(20,24,30,0.92)";
+      g.fillRect(0,hy,w,70);
+      g.fillStyle = "rgba(240,246,255,0.22)";
+      g.fillRect(0,hy+10,w,4);
+      g.globalAlpha = 0.35; g.fillStyle="#fff";
+      for (let x=0;x<w;x+=80) g.fillRect(x+18, hy+38, 26, 3);
+      g.globalAlpha = 0.28; g.fillStyle="#000";
+      g.fillRect(0, hy+68, w, 10);
+      g.globalAlpha = 1;
+
+      // Green strip
+      g.fillStyle = "#2ea44f"; g.globalAlpha = 0.62;
+      g.fillRect(0,hy+70,w,26);
+      g.globalAlpha = 0.35;
+      for (let i=0;i<120;i++){
+        const x = rand(0,w), y = rand(hy+72, hy+92), r = rand(6,18);
+        g.beginPath(); g.arc(x,y,r,0,Math.PI*2); g.fill();
+      }
+      g.globalAlpha = 1;
+
+      // Ground
+      const ground = g.createLinearGradient(0, hy+96, 0, h);
+      ground.addColorStop(0, "#3b2a1f");
+      ground.addColorStop(1, "#2a1c14");
+      g.fillStyle = ground;
+      g.fillRect(0, hy+96, w, h-(hy+96));
+
+      // Settlement silhouettes
+      g.globalAlpha = 0.52;
+      for (let i=0;i<160;i++){
+        const sx = rand(-10,w+10);
+        const sy = rand(hy+118, h-70);
+        const sw = rand(10,26);
+        const sh = rand(8,18);
+        g.fillStyle = "rgba(40,20,16,0.55)";
+        g.fillRect(sx,sy,sw,sh);
+        g.beginPath();
+        g.moveTo(sx-2,sy);
+        g.lineTo(sx+sw/2,sy-6);
+        g.lineTo(sx+sw+2,sy);
+        g.closePath();
+        g.fill();
+      }
+      g.globalAlpha = 1;
+
+      // Vignette
+      const v = g.createRadialGradient(w/2, h*0.65, 50, w/2, h*0.65, 520);
+      v.addColorStop(0, "rgba(0,0,0,0)");
+      v.addColorStop(1, "rgba(0,0,0,0.20)");
+      g.fillStyle = v;
+      g.fillRect(0,0,w,h);
+    });
+  }
+
+  function spawnHomes() {
+    homes.length = 0;
+    const cols = Math.floor(W / laneSize);
+    const rows = Math.floor((H - topMargin - bottomMargin) / laneSize);
+    const count = 58;
+    const used = new Set();
+    for (let i=0;i<count;i++){
+      let tries=0;
+      while (tries++ < 50) {
+        const gx = Math.floor(rand(2, cols-2));
+        const gy = Math.floor(rand(1, rows-2));
+        const y = topMargin + gy*laneSize;
+        if (y > H - 170) continue;
+        const key = gx + "," + gy;
+        if (used.has(key)) continue;
+        used.add(key);
+        homes.push({ x: gx*laneSize + laneSize/2, y, hp: HOME_HP_MAX });
+        break;
+      }
+    }
+  }
+
+  function spawnConvoy(len=12) {
+    convoy = [];
+    convoyDir = 1;
+    const startY = topMargin + laneSize;
+    const startX = laneSize * 2;
+    for (let i=0;i<len;i++){
+      convoy.push({ x: startX - i*laneSize, y: startY, head: i===0 });
+    }
+  }
+
+  function resetSpiderTimers() {
+    spider.active = false;
+    spider.spawnTimer = 0;
+    spider.nextSpawnIn = rand(3.5, 7.5);
+  }
+
+  function spawnSpider() {
+    spider.active = true;
+    spider.r = 14;
+    spider.x = rand(120, W-120);
+    spider.y = rand(topMargin + 120, H - 180);
+    const speed = rand(210, 330) + pressure * 18;
+    const ang = rand(0, Math.PI*2);
+    spider.vx = Math.cos(ang) * speed;
+    spider.vy = Math.sin(ang) * speed;
+    if (Math.abs(spider.vy) < 80) spider.vy += (spider.vy < 0 ? -120 : 120);
+    beep(340, 0.06, 0.03, "sawtooth");
+  }
+
+  function reset() {
+    started = false;
+    paused = false;
+    gameOver = false;
+    score = 0;
+    displacement = 0;
+    pressure = 1;
+    bullets.length = 0;
+    particles.length = 0;
+    player.x = W/2;
+    player.cooldown = 0;
+    convoyStepTimer = 0;
+
+    buildBackdrop();
+    spawnHomes();
+    spawnConvoy(12);
+    resetSpiderTimers();
+
+    tip.style.display = "block";
+  }
+
+  function togglePause() {
+    if (!started || gameOver) return;
+    paused = !paused;
+    pauseBtn.textContent = paused ? "RESUME" : "PAUSE";
+    beep(paused ? 260 : 520, 0.06, 0.04, "square");
+  }
+
+  function nearestHomeAtGrid(x,y) {
+    let best=null, bestD=1e9;
+    for (const h of homes) {
+      const dx=h.x-x, dy=h.y-y;
+      const d=dx*dx+dy*dy;
+      if (d < bestD) { bestD=d; best=h; }
+    }
+    if (best && bestD < (homeSize*homeSize)) return best;
+    return null;
+  }
+
+  function roundRect(x,y,w,h,r) {
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+
+  function addParticles(x,y,n=10, color="rgba(255,255,255,0.9)") {
+    for (let i=0;i<n;i++){
+      particles.push({
+        x,y,
+        vx: rand(-150,150),
+        vy: rand(-190,50),
+        life: rand(0.22,0.55),
+        t:0,
+        r: rand(1.2,3.0),
+        color
+      });
+    }
+  }
+
+  function drawHouse(h) {
+    const x=h.x, y=h.y;
+    ctx.save();
+    ctx.translate(x,y);
+
+    ctx.fillStyle = COL.shadow;
+    ctx.beginPath(); ctx.ellipse(0, 12, 14, 5, 0, 0, Math.PI*2); ctx.fill();
+
+    const c = (h.hp===3)?COL.house:(h.hp===2)?COL.house2:COL.house3;
+
+    ctx.fillStyle = "rgba(60,45,35,0.95)";
+    ctx.beginPath();
+    ctx.moveTo(-14,-2); ctx.lineTo(0,-14); ctx.lineTo(14,-2);
+    ctx.closePath(); ctx.fill();
+
+    ctx.fillStyle = c;
+    roundRect(-12,-2,24,20,4); ctx.fill();
+
+    ctx.fillStyle = "rgba(40,25,18,0.55)";
+    roundRect(-3,7,6,11,2); ctx.fill();
+
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    roundRect(-9,6,6,6,2); ctx.fill();
+    ctx.fillStyle = "rgba(0,0,0,0.18)";
+    ctx.fillRect(-9,9,6,1);
+    ctx.fillRect(-6,6,1,6);
+
+    ctx.strokeStyle = "rgba(0,0,0,0.20)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    if (h.hp < 3) {
+      ctx.fillStyle = "rgba(0,0,0,0.18)";
+      ctx.fillRect(6,4,3,3);
+      if (h.hp===1) ctx.fillRect(-11,10,3,3);
+    }
+
+    ctx.restore();
+  }
+
+  function drawDozer(seg, flip) {
+    const x=seg.x, y=seg.y;
+    ctx.save();
+    ctx.translate(x,y);
+    if (flip) ctx.scale(-1,1);
+
+    ctx.fillStyle = COL.shadow;
+    ctx.beginPath(); ctx.ellipse(0, 13, 16, 5, 0, 0, Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = "rgba(18,18,22,0.92)";
+    roundRect(-16,6,32,10,5); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.18)";
+    ctx.fillRect(-13,8,26,2);
+
+    ctx.fillStyle = seg.head ? COL.convoyHead : COL.convoy;
+    roundRect(-14,-5,28,16,5); ctx.fill();
+
+    if (seg.head) {
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      roundRect(0,-16,12,11,3); ctx.fill();
+      ctx.fillStyle = "rgba(0,0,0,0.18)";
+      ctx.fillRect(3,-13,6,4);
+
+      ctx.fillStyle = "rgba(210,220,235,0.95)";
+      roundRect(-22,0,9,15,3); ctx.fill();
+      ctx.fillStyle = "rgba(0,0,0,0.15)";
+      ctx.fillRect(-20,2,5,10);
+    } else {
+      ctx.fillStyle = "rgba(255,255,255,0.20)";
+      ctx.fillRect(-10,-2,20,2);
+    }
+
+    ctx.strokeStyle = "rgba(0,0,0,0.20)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawSpider() {
+    if (!spider.active) return;
+    const x=spider.x, y=spider.y, r=spider.r;
+    ctx.save();
+    ctx.translate(x,y);
+
+    ctx.fillStyle = "rgba(0,0,0,0.18)";
+    ctx.beginPath(); ctx.ellipse(0, r+6, r*1.1, r*0.35, 0, 0, Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = "rgba(40,12,20,0.9)";
+    ctx.beginPath(); ctx.ellipse(0,0,r,r*0.85,0,0,Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    ctx.beginPath(); ctx.ellipse(-3,-2,r*0.5,r*0.25,-0.3,0,Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.beginPath(); ctx.arc(-5,-3,2.2,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(5,-3,2.2,0,Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.beginPath(); ctx.arc(-5,-3,1.0,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(5,-3,1.0,0,Math.PI*2); ctx.fill();
+
+    ctx.strokeStyle = "rgba(20,6,10,0.95)";
+    ctx.lineWidth = 2.2;
+    for (let i=0;i<4;i++){
+      const dx=8+i*3;
+      ctx.beginPath();
+      ctx.moveTo(-6,2);
+      ctx.quadraticCurveTo(-dx,8,-(dx+6),12);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(6,2);
+      ctx.quadraticCurveTo(dx,8,(dx+6),12);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function drawPlayer() {
+    const x=player.x, y=player.y;
+    ctx.save(); ctx.translate(x,y);
+    ctx.fillStyle = COL.shadow;
+    ctx.beginPath(); ctx.ellipse(0, 12, 16, 5, 0, 0, Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = COL.player;
+    roundRect(-16,-2,32,16,8); ctx.fill();
+
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    roundRect(-6,-14,12,10,4); ctx.fill();
+
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    roundRect(16,1,9,9,3); ctx.fill();
+
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function overlayBox(title, lines) {
+    const bw=560, bh=290;
+    const x=(W-bw)/2, y=(H-bh)/2;
+    ctx.save();
+    ctx.fillStyle = "rgba(10,14,18,0.62)";
+    roundRect(x,y,bw,bh,14); ctx.fill();
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth=2; ctx.stroke();
+
+    ctx.fillStyle = COL.ui;
+    ctx.font = "28px ui-monospace, monospace";
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText(title, W/2, y+56);
+
+    ctx.fillStyle = COL.uiMuted;
+    ctx.font = "15px ui-monospace, monospace";
+    let yy = y+110;
+    for (let i=0;i<lines.length;i++){
+      ctx.fillText(lines[i], W/2, yy);
+      yy += 22;
+    }
+    ctx.restore();
+  }
+
+  let last = 0;
+  function update(dt) {
+    if (!started || paused || gameOver) return;
+
+    pressure = 1 + Math.floor(score / 520) + Math.floor((performance.now()/1000)/40);
+    pressure = clamp(pressure, 1, 8);
+
+    // Move (keyboard or touch)
+    let dir = 0;
+    if (keys.has("arrowleft") || keys.has("a")) dir -= 1;
+    if (keys.has("arrowright") || keys.has("d")) dir += 1;
+    if (dir !== 0) player.x += dir * player.speed * dt;
+    else if (touchActive) {
+      // ease toward touch point for smoothness
+      player.x += (touchX - player.x) * clamp(dt*10, 0, 1);
+    }
+    player.x = clamp(player.x, 24, W-24);
+
+    // Fire (keyboard or touch/buttons)
+    player.cooldown -= dt;
+    const wantFire = keys.has("space") || fireHeld;
+    if (wantFire && player.cooldown <= 0) {
+      bullets.push({ x: player.x, y: player.y - 16, vx: 0, vy: -780, r: 3 });
+      player.cooldown = 0.13;
+      beep(920, 0.03, 0.03, "square");
+      // start game if not started (mobile UX)
+    }
+
+    // Bullets
+    for (let i=bullets.length-1;i>=0;i--){
+      const b=bullets[i];
+      b.y += b.vy * dt;
+      if (b.y < -30) bullets.splice(i,1);
+    }
+
+    // Spider spawn
+    spider.spawnTimer += dt;
+    if (!spider.active && spider.spawnTimer >= spider.nextSpawnIn) {
+      spider.spawnTimer = 0;
+      spider.nextSpawnIn = rand(4.0, 8.0);
+      spawnSpider();
+    }
+
+    // Spider movement
+    if (spider.active) {
+      const chaos = 40;
+      spider.vx += rand(-chaos, chaos) * dt;
+      spider.vy += rand(-chaos, chaos) * dt;
+
+      const spd = Math.hypot(spider.vx, spider.vy);
+      const minS = 180, maxS = 420 + pressure*20;
+      if (spd < minS) { const k = minS / Math.max(1, spd); spider.vx *= k; spider.vy *= k; }
+      else if (spd > maxS) { const k = maxS / spd; spider.vx *= k; spider.vy *= k; }
+
+      spider.x += spider.vx * dt;
+      spider.y += spider.vy * dt;
+
+      const left = 30, right = W-30;
+      const top = topMargin + 50, bottom = H - 110;
+
+      if (spider.x < left) { spider.x = left; spider.vx *= -1; }
+      if (spider.x > right) { spider.x = right; spider.vx *= -1; }
+      if (spider.y < top) { spider.y = top; spider.vy *= -1; }
+      if (spider.y > bottom) { spider.y = bottom; spider.vy *= -1; }
+
+      if (rectHit(player.x-player.w/2, player.y-player.h/2, player.w, player.h,
+                  spider.x-spider.r, spider.y-spider.r, spider.r*2, spider.r*2)) {
+        gameOver = true;
+        beep(110, 0.12, 0.06, "square");
+      }
+    }
+
+    // Convoy stepping
+    convoyStepTimer += dt;
+    const stepEvery = clamp(0.22 - pressure*0.016, 0.10, 0.22);
+    if (convoyStepTimer >= stepEvery) {
+      convoyStepTimer = 0;
+
+      const head = convoy[0];
+      const nextX = head.x + convoyDir*laneSize;
+
+      const wouldWall = nextX < laneSize || nextX > W - laneSize;
+      const wouldHome = nearestHomeAtGrid(nextX, head.y);
+
+      if (wouldWall || wouldHome) {
+        convoyDir *= -1;
+        for (const seg of convoy) seg.y += laneSize;
+
+        if (convoy.some(s => s.y > H - 120)) {
+          gameOver = true;
+          beep(110, 0.12, 0.06, "square");
+        }
+      } else {
+        const prev = convoy.map(s => ({x:s.x, y:s.y}));
+        convoy[0].x = nextX;
+        for (let i=1;i<convoy.length;i++){
+          convoy[i].x = prev[i-1].x;
+          convoy[i].y = prev[i-1].y;
+        }
+      }
+
+      // Convoy damages homes
+      for (const seg of convoy) {
+        const h = nearestHomeAtGrid(seg.x, seg.y);
+        if (h) {
+          h.hp -= 1;
+          if (h.hp <= 0) {
+            displacement += 1;
+            const idx = homes.indexOf(h);
+            if (idx >= 0) homes.splice(idx,1);
+          }
+        }
+      }
+    }
+
+    // Bullet collisions
+    for (let bi=bullets.length-1; bi>=0; bi--) {
+      const b = bullets[bi];
+      let hit = false;
+
+      // homes: 3 hits to clear
+      for (let hi=0; hi<homes.length; hi++){
+        const h = homes[hi];
+        if (rectHit(b.x-2,b.y-2,4,4, h.x-homeSize/2, h.y-homeSize/2, homeSize, homeSize)) {
+          h.hp -= 1;
+          score += 10;
+          addParticles(h.x, h.y, 10, "rgba(255,255,255,0.75)");
+          if (h.hp <= 0) homes.splice(hi,1);
+          hit = true;
+          break;
+        }
+      }
+      if (hit) { bullets.splice(bi,1); continue; }
+
+      // spider
+      if (spider.active && rectHit(b.x-3,b.y-3,6,6, spider.x-spider.r, spider.y-spider.r, spider.r*2, spider.r*2)) {
+        score += 120;
+        addParticles(spider.x, spider.y, 26, "rgba(255,255,255,0.95)");
+        spider.active = false;
+        spider.spawnTimer = 0;
+        spider.nextSpawnIn = rand(3.0, 6.0);
+        bullets.splice(bi,1);
+        continue;
+      }
+
+      // convoy
+      for (let si=0; si<convoy.length; si++){
+        const s = convoy[si];
+        const sx = s.x - laneSize/2 + 2;
+        const sy = s.y - laneSize/2 + 2;
+        const sw = laneSize - 4, sh = laneSize - 4;
+        if (rectHit(b.x-2,b.y-2,4,4, sx,sy,sw,sh)) {
+          score += s.head ? 40 : 25;
+          const removed = convoy.splice(si,1)[0];
+          homes.push({ x: removed.x, y: removed.y, hp: HOME_HP_MAX });
+          if (si === 0 && convoy.length) convoy[0].head = true;
+          if (convoy.length === 0) spawnConvoy(clamp(12 + Math.floor(score/320), 12, 22));
+          hit = true;
+          break;
+        }
+      }
+      if (hit) bullets.splice(bi,1);
+    }
+
+    // particles
+    for (let i=particles.length-1;i>=0;i--){
+      const p=particles[i];
+      p.t += dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 520 * dt;
+      if (p.t >= p.life) particles.splice(i,1);
+    }
+
+    score += dt * (8 + pressure*2);
+  }
+
+  function draw() {
+    ctx.clearRect(0,0,W,H);
+    if (bgCanvas) ctx.drawImage(bgCanvas, 0, 0);
+
+    // readability wash
+    ctx.fillStyle = "rgba(0,0,0,0.10)";
+    ctx.fillRect(0, topMargin, W, H - topMargin - bottomMargin);
+
+    // HUD bars (in-canvas, but you also have HTML HUD)
+    ctx.fillStyle = COL.panel;
+    ctx.fillRect(0,0,W,56);
+    ctx.fillRect(0,H-56,W,56);
+
+    ctx.fillStyle = COL.ui;
+    ctx.font = "16px ui-monospace, monospace";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Right of Way", 16, 28);
+
+    ctx.fillStyle = COL.uiMuted;
+    ctx.font = "14px ui-monospace, monospace";
+    ctx.fillText("Mutual Aid: " + Math.floor(score), 210, 28);
+    ctx.fillText("Displacement: " + displacement, 390, 28);
+    ctx.fillText("Pressure: " + pressure, 570, 28);
+
+    // World
+    for (const h of homes) drawHouse(h);
+    for (const s of convoy) drawDozer(s, convoyDir < 0);
+    drawSpider();
+    drawPlayer();
+
+    // bullets
+    ctx.fillStyle = COL.bullet;
+    for (const b of bullets) {
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI*2); ctx.fill();
+      ctx.fillRect(b.x-1, b.y+6, 2, 3);
+    }
+
+    // particles
+    for (const p of particles) {
+      const a = 1 - (p.t / p.life);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    if (!started) {
+      overlayBox("RIGHT OF WAY", [
+        "Mobile: drag to move. Tap FIRE to shoot.",
+        "Houses take 3 hits to clear.",
+        "Spider bounces randomly. Touching it ends the run.",
+        "",
+        "Tap FIRE or press SPACE to start."
+      ]);
+    } else if (paused) {
+      overlayBox("PAUSED", ["Tap PAUSE to resume."]);
+    } else if (gameOver) {
+      overlayBox("OVERRUN", [
+        "Pressure reached the last line, or the spider got you.",
+        "",
+        "Mutual Aid: " + Math.floor(score),
+        "Displacement: " + displacement,
+        "",
+        "Tap Reload (R) to restart."
+      ]);
+    }
+
+    // Update HTML HUD text
+    hudLeft.textContent = `Mutual Aid: ${Math.floor(score)} • Displacement: ${displacement} • Pressure: ${pressure}`;
+    hudRight.textContent = paused ? "Paused" : (muted ? "Muted" : "Sound on");
+  }
+
+  function loop(ts) {
+    const dt = clamp((ts - last) / 1000, 0, 0.033);
+    last = ts;
+
+    // Start on first fire (mobile UX)
+    if (!started && (keys.has("space") || fireHeld)) {
+      started = true;
+      tip.style.display = "none";
+      beep(660, 0.06, 0.05, "square");
+    }
+
+    // Desktop start with space
+    if (!started && keys.has("space")) {
+      started = true;
+      tip.style.display = "none";
+      beep(660, 0.06, 0.05, "square");
+      keys.delete("space");
+    }
+
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  reset();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
