@@ -1,0 +1,976 @@
+desktop/index.html
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Right of Way (Backdrop + Spider + 3-hit Houses)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b0f14; color:#e7eef7; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    #wrap { display:flex; align-items:center; justify-content:center; height:100%; }
+    canvas { border:1px solid rgba(231,238,247,.18); border-radius: 10px; background:#000; }
+    .hint {
+      position: fixed; left: 14px; bottom: 12px; opacity: .8; font-size: 12px; line-height: 1.25;
+      max-width: 760px;
+    }
+    .hint b { opacity: 1; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+</div>
+<div class="hint">
+  <div><b>Controls:</b> Move: Arrow keys / A-D | Fire: Space | Pause: P | Restart: R | Mute: M</div>
+  <div><b>Rules:</b> Houses take 3 shots to clear. Spider bounces randomly. Touching spider ends the run.</div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  // Logical size (CSS pixels)
+  const CSS_W = 900, CSS_H = 600;
+
+  // HiDPI scaling for a cleaner, "upscaled" look
+  function resizeCanvas() {
+    const dpr = Math.max(1, Math.min(2.5, window.devicePixelRatio || 1));
+    canvas.style.width = CSS_W + "px";
+    canvas.style.height = CSS_H + "px";
+    canvas.width = Math.floor(CSS_W * dpr);
+    canvas.height = Math.floor(CSS_H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  resizeCanvas();
+  window.addEventListener("resize", resizeCanvas);
+
+  const W = CSS_W, H = CSS_H;
+
+  // Gameplay grid feel (still Centipede-like)
+  const laneSize = 30;
+  const topMargin = 70;
+  const bottomMargin = 70;
+
+  // Palette (brighter, less dark)
+  const COL = {
+    ui: "#f1f6ff",
+    uiMuted: "rgba(241,246,255,0.72)",
+    panel: "rgba(5,10,16,0.55)",
+    panel2: "rgba(5,10,16,0.35)",
+    outline: "rgba(241,246,255,0.18)",
+    bullet: "#ffd166",
+    player: "#3be4c5",
+    danger: "#ff4d6d",
+    convoy: "#2f7cff",
+    convoyHead: "#6aa6ff",
+    spark: "rgba(255,255,255,0.9)",
+    house: "#ffd7a8",
+    house2: "#ffb38a",
+    house3: "#ff8d6b",
+    shadow: "rgba(0,0,0,0.25)",
+  };
+
+  // Audio
+  let audioCtx = null;
+  let muted = false;
+  function beep(freq=440, dur=0.05, vol=0.04, type="square") {
+    if (muted) return;
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = type;
+      o.frequency.value = freq;
+      g.gain.value = vol;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start();
+      o.stop(audioCtx.currentTime + dur);
+    } catch {}
+  }
+
+  // Helpers
+  const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+  const rand = (a,b) => a + Math.random() * (b-a);
+
+  function rectHit(ax,ay,aw,ah, bx,by,bw,bh) {
+    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+  }
+
+  // Input
+  const keys = new Set();
+  window.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    keys.add(k === " " ? "space" : k);
+    if (k === "p") togglePause();
+    if (k === "r") reset();
+    if (k === "m") { muted = !muted; beep(muted ? 180 : 720, 0.06, 0.05, "square"); }
+    if (["arrowup","arrowdown"," "].includes(e.key)) e.preventDefault();
+  });
+  window.addEventListener("keyup", (e) => {
+    const k = e.key.toLowerCase();
+    keys.delete(k === " " ? "space" : k);
+  });
+
+  // State
+  let last = 0;
+  let started = false;
+  let paused = false;
+  let gameOver = false;
+
+  let score = 0;
+  let displacement = 0;
+  let pressure = 1;
+
+  const bullets = [];
+  const particles = [];
+
+  const player = {
+    w: 36, h: 18,
+    x: W/2, y: H - 45,
+    speed: 440,
+    cooldown: 0,
+  };
+
+  // Houses: 3 hits to clear (Centipede mushroom behavior)
+  const homes = [];
+  const homeSize = 26;
+  const HOME_HP_MAX = 3;
+
+  // Convoy
+  let convoy = [];
+  let convoyDir = 1;
+  let convoyStepTimer = 0;
+
+  // Spider (random bouncy enemy)
+  const spider = {
+    active: false,
+    x: 0, y: 0,
+    vx: 0, vy: 0,
+    r: 14,
+    spawnTimer: 0,
+    nextSpawnIn: 4,
+  };
+
+  // Background cache (vector painted once)
+  let bgCanvas = null;
+
+  function makeOffscreen(w, h, drawFn) {
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    const g = c.getContext("2d");
+    drawFn(g, w, h);
+    return c;
+  }
+
+  function buildBackdrop() {
+    // Offscreen at CSS resolution for crisp vector look
+    bgCanvas = makeOffscreen(W, H, (g,w,h) => {
+      g.clearRect(0,0,w,h);
+
+      // Sky gradient
+      const sky = g.createLinearGradient(0,0,0,h);
+      sky.addColorStop(0, "#bfe8ff");
+      sky.addColorStop(0.35, "#7fd1ff");
+      sky.addColorStop(0.68, "#5aa9ff");
+      sky.addColorStop(1, "#2a5fbe");
+      g.fillStyle = sky;
+      g.fillRect(0,0,w,h);
+
+      // Sun haze
+      g.save();
+      g.globalAlpha = 0.22;
+      const sun = g.createRadialGradient(w*0.12, h*0.12, 0, w*0.12, h*0.12, 210);
+      sun.addColorStop(0, "rgba(255,255,255,1)");
+      sun.addColorStop(1, "rgba(255,255,255,0)");
+      g.fillStyle = sun;
+      g.fillRect(0,0,w,h);
+      g.restore();
+
+      // Distant haze layer
+      g.save();
+      g.globalAlpha = 0.22;
+      g.fillStyle = "#ffffff";
+      g.fillRect(0, 120, w, 110);
+      g.restore();
+
+      // Nairobi-ish skyline (cartoon blocks)
+      g.save();
+      g.globalAlpha = 0.9;
+      const baseY = 175;
+      for (let i=0; i<75; i++) {
+        const bw = Math.floor(rand(14, 46));
+        const bh = Math.floor(rand(18, 110));
+        const bx = Math.floor(rand(-20, w+20));
+        const by = baseY - bh + Math.floor(rand(-8, 8));
+
+        g.fillStyle = "rgba(16,35,70,0.55)";
+        g.fillRect(bx, by, bw, bh);
+
+        // Windows
+        g.globalAlpha = 0.35;
+        g.fillStyle = "rgba(255,255,255,0.7)";
+        const wx = bx + 4, wy = by + 6;
+        for (let yy=wy; yy<by+bh-8; yy+=10) {
+          for (let xx=wx; xx<bx+bw-6; xx+=10) {
+            if (Math.random() < 0.25) g.fillRect(xx, yy, 3, 4);
+          }
+        }
+        g.globalAlpha = 0.9;
+      }
+      g.restore();
+
+      // Highway flyover band
+      const hy = 205;
+      g.save();
+      g.fillStyle = "rgba(20,24,30,0.92)";
+      g.fillRect(0, hy, w, 70);
+
+      // guardrail
+      g.fillStyle = "rgba(240,246,255,0.22)";
+      g.fillRect(0, hy+10, w, 4);
+
+      // lane markings
+      g.fillStyle = "rgba(255,255,255,0.75)";
+      g.globalAlpha = 0.35;
+      for (let x=0; x<w; x+=80) g.fillRect(x+18, hy+38, 26, 3);
+
+      // shadow under flyover
+      g.globalAlpha = 0.28;
+      g.fillStyle = "rgba(0,0,0,1)";
+      g.fillRect(0, hy+68, w, 10);
+      g.restore();
+
+      // Greenery strip
+      g.save();
+      g.fillStyle = "#2ea44f";
+      g.globalAlpha = 0.65;
+      g.fillRect(0, hy+70, w, 26);
+      g.globalAlpha = 0.35;
+      for (let i=0;i<120;i++){
+        const x = rand(0,w), y = rand(hy+72, hy+92), r = rand(6,18);
+        g.beginPath();
+        g.arc(x,y,r,0,Math.PI*2);
+        g.fill();
+      }
+      g.restore();
+
+      // Ground
+      g.save();
+      const ground = g.createLinearGradient(0, hy+96, 0, h);
+      ground.addColorStop(0, "#3b2a1f");
+      ground.addColorStop(1, "#2a1c14");
+      g.fillStyle = ground;
+      g.fillRect(0, hy+96, w, h-(hy+96));
+      g.restore();
+
+      // Informal settlement silhouettes (cartoon, not pixel)
+      g.save();
+      g.globalAlpha = 0.52;
+      for (let i=0; i<160; i++) {
+        const sx = rand(-10, w+10);
+        const sy = rand(hy+118, h-70);
+        const sw = rand(10, 26);
+        const sh = rand(8, 18);
+        g.fillStyle = "rgba(40,20,16,0.55)";
+        g.fillRect(sx, sy, sw, sh);
+        // roof
+        g.beginPath();
+        g.moveTo(sx-2, sy);
+        g.lineTo(sx+sw/2, sy-6);
+        g.lineTo(sx+sw+2, sy);
+        g.closePath();
+        g.fill();
+      }
+      g.restore();
+
+      // Light vignette (subtle)
+      g.save();
+      const v = g.createRadialGradient(w/2, h*0.65, 50, w/2, h*0.65, 520);
+      v.addColorStop(0, "rgba(0,0,0,0)");
+      v.addColorStop(1, "rgba(0,0,0,0.22)");
+      g.fillStyle = v;
+      g.fillRect(0,0,w,h);
+      g.restore();
+    });
+  }
+
+  function spawnHomes() {
+    homes.length = 0;
+    const cols = Math.floor(W / laneSize);
+    const rows = Math.floor((H - topMargin - bottomMargin) / laneSize);
+
+    const count = 58;
+    const used = new Set();
+    for (let i=0; i<count; i++) {
+      let tries = 0;
+      while (tries++ < 50) {
+        const gx = Math.floor(rand(2, cols-2));
+        const gy = Math.floor(rand(1, rows-2));
+        const y = topMargin + gy*laneSize;
+        if (y > H - 170) continue;
+        const key = gx + "," + gy;
+        if (used.has(key)) continue;
+        used.add(key);
+
+        homes.push({
+          x: gx*laneSize + laneSize/2,
+          y,
+          hp: HOME_HP_MAX
+        });
+        break;
+      }
+    }
+  }
+
+  function spawnConvoy(len=12) {
+    convoy = [];
+    convoyDir = 1;
+    const startY = topMargin + laneSize;
+    const startX = laneSize * 2;
+    for (let i=0; i<len; i++) {
+      convoy.push({
+        x: startX - i*laneSize,
+        y: startY,
+        head: i === 0,
+      });
+    }
+  }
+
+  function resetSpiderTimers() {
+    spider.active = false;
+    spider.spawnTimer = 0;
+    spider.nextSpawnIn = rand(3.5, 7.5);
+  }
+
+  function spawnSpider() {
+    spider.active = true;
+    spider.r = 14;
+    spider.x = rand(120, W-120);
+    spider.y = rand(topMargin + 120, H - 180);
+    const speed = rand(210, 330) + pressure * 18;
+    const ang = rand(0, Math.PI*2);
+    spider.vx = Math.cos(ang) * speed;
+    spider.vy = Math.sin(ang) * speed;
+
+    // Ensure some vertical chaos like the original
+    if (Math.abs(spider.vy) < 80) spider.vy += (spider.vy < 0 ? -120 : 120);
+    beep(340, 0.06, 0.03, "sawtooth");
+  }
+
+  function addParticles(x,y,n=10, color=COL.spark) {
+    for (let i=0;i<n;i++) {
+      particles.push({
+        x, y,
+        vx: rand(-150,150),
+        vy: rand(-190,50),
+        life: rand(0.22, 0.55),
+        t: 0,
+        r: rand(1.2, 3.0),
+        color
+      });
+    }
+  }
+
+  function togglePause() {
+    if (!started || gameOver) return;
+    paused = !paused;
+    beep(paused ? 260 : 520, 0.06, 0.04, "square");
+  }
+
+  function reset() {
+    started = false;
+    paused = false;
+    gameOver = false;
+    score = 0;
+    displacement = 0;
+    pressure = 1;
+    bullets.length = 0;
+    particles.length = 0;
+    player.x = W/2;
+    player.cooldown = 0;
+    convoyStepTimer = 0;
+
+    buildBackdrop();
+    spawnHomes();
+    spawnConvoy(12);
+    resetSpiderTimers();
+  }
+
+  function nearestHomeAtGrid(x,y) {
+    let best = null;
+    let bestD = 1e9;
+    for (const h of homes) {
+      const dx = h.x - x, dy = h.y - y;
+      const d = dx*dx + dy*dy;
+      if (d < bestD) { bestD = d; best = h; }
+    }
+    if (best && bestD < (homeSize*homeSize)) return best;
+    return null;
+  }
+
+  function drawHouse(h) {
+    // Cartoon house icon, 3 damage states
+    const x = h.x, y = h.y;
+    const scale = 1.12;
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+
+    // Shadow
+    ctx.fillStyle = COL.shadow;
+    ctx.beginPath();
+    ctx.ellipse(0, 11, 14, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // State-based color
+    const c = (h.hp === 3) ? COL.house :
+              (h.hp === 2) ? COL.house2 : COL.house3;
+
+    // Roof
+    ctx.fillStyle = "rgba(60,45,35,0.95)";
+    ctx.beginPath();
+    ctx.moveTo(-14, -2);
+    ctx.lineTo(0, -14);
+    ctx.lineTo(14, -2);
+    ctx.closePath();
+    ctx.fill();
+
+    // Walls
+    ctx.fillStyle = c;
+    roundRect(-12, -2, 24, 20, 4);
+    ctx.fill();
+
+    // Door
+    ctx.fillStyle = "rgba(40,25,18,0.55)";
+    roundRect(-3, 7, 6, 11, 2);
+    ctx.fill();
+
+    // Window
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    roundRect(-9, 6, 6, 6, 2);
+    ctx.fill();
+    ctx.fillStyle = "rgba(0,0,0,0.18)";
+    ctx.fillRect(-9, 9, 6, 1);
+    ctx.fillRect(-6, 6, 1, 6);
+
+    // Outline
+    ctx.strokeStyle = "rgba(0,0,0,0.22)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Damage chips
+    if (h.hp < 3) {
+      ctx.fillStyle = "rgba(0,0,0,0.20)";
+      ctx.fillRect(6, 4, 3, 3);
+      if (h.hp === 1) ctx.fillRect(-11, 10, 3, 3);
+    }
+
+    ctx.restore();
+  }
+
+  function roundRect(x,y,w,h,r) {
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+
+  function drawDozer(seg, flip) {
+    // Cartoon dozer (head has blade + cab)
+    const x = seg.x, y = seg.y;
+
+    ctx.save();
+    ctx.translate(x, y);
+    if (flip) ctx.scale(-1, 1);
+
+    // Shadow
+    ctx.fillStyle = COL.shadow;
+    ctx.beginPath();
+    ctx.ellipse(0, 13, 16, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Tracks
+    ctx.fillStyle = "rgba(18,18,22,0.92)";
+    roundRect(-16, 6, 32, 10, 5);
+    ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.18)";
+    ctx.fillRect(-13, 8, 26, 2);
+
+    // Body
+    ctx.fillStyle = seg.head ? COL.convoyHead : COL.convoy;
+    roundRect(-14, -5, 28, 16, 5);
+    ctx.fill();
+
+    // Cab
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    if (seg.head) {
+      roundRect(0, -16, 12, 11, 3);
+      ctx.fill();
+      ctx.fillStyle = "rgba(0,0,0,0.18)";
+      ctx.fillRect(3, -13, 6, 4);
+    } else {
+      // body segment accent
+      ctx.fillStyle = "rgba(255,255,255,0.20)";
+      ctx.fillRect(-10, -2, 20, 2);
+    }
+
+    // Blade for head
+    if (seg.head) {
+      ctx.fillStyle = "rgba(210,220,235,0.95)";
+      roundRect(-22, 0, 9, 15, 3);
+      ctx.fill();
+      ctx.fillStyle = "rgba(0,0,0,0.15)";
+      ctx.fillRect(-20, 2, 5, 10);
+    }
+
+    // Outline
+    ctx.strokeStyle = "rgba(0,0,0,0.22)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  function drawPlayer() {
+    const x = player.x, y = player.y;
+    ctx.save();
+    ctx.translate(x,y);
+
+    // Shadow
+    ctx.fillStyle = COL.shadow;
+    ctx.beginPath();
+    ctx.ellipse(0, 12, 16, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Body
+    ctx.fillStyle = COL.player;
+    roundRect(-16, -2, 32, 16, 8);
+    ctx.fill();
+
+    // Head
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    roundRect(-6, -14, 12, 10, 4);
+    ctx.fill();
+
+    // Megaphone
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    roundRect(16, 1, 9, 9, 3);
+    ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.20)";
+    ctx.fillRect(18, 3, 5, 2);
+
+    // Outline
+    ctx.strokeStyle = "rgba(0,0,0,0.18)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  function drawSpider() {
+    if (!spider.active) return;
+
+    const x = spider.x, y = spider.y, r = spider.r;
+
+    ctx.save();
+    ctx.translate(x,y);
+
+    // Shadow
+    ctx.fillStyle = "rgba(0,0,0,0.18)";
+    ctx.beginPath();
+    ctx.ellipse(0, r+6, r*1.1, r*0.35, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Body
+    ctx.fillStyle = "rgba(40,12,20,0.9)";
+    ctx.beginPath();
+    ctx.ellipse(0, 0, r, r*0.85, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Marking
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    ctx.beginPath();
+    ctx.ellipse(-3, -2, r*0.5, r*0.25, -0.3, 0, Math.PI*2);
+    ctx.fill();
+
+    // Eyes
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.beginPath(); ctx.arc(-5, -3, 2.2, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(5, -3, 2.2, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.beginPath(); ctx.arc(-5, -3, 1.0, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(5, -3, 1.0, 0, Math.PI*2); ctx.fill();
+
+    // Legs
+    ctx.strokeStyle = "rgba(20,6,10,0.95)";
+    ctx.lineWidth = 2.2;
+    for (let i=0;i<4;i++){
+      const dx = 8 + i*3;
+      ctx.beginPath();
+      ctx.moveTo(-6, 2);
+      ctx.quadraticCurveTo(-dx, 8, -(dx+6), 12);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(6, 2);
+      ctx.quadraticCurveTo(dx, 8, (dx+6), 12);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function overlayBox(title, lines) {
+    const bw = 560, bh = 290;
+    const x = (W - bw) / 2;
+    const y = (H - bh) / 2;
+
+    ctx.save();
+    ctx.fillStyle = "rgba(10,14,18,0.62)";
+    roundRect(x, y, bw, bh, 14);
+    ctx.fill();
+    ctx.strokeStyle = COL.outline;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.fillStyle = COL.ui;
+    ctx.font = "28px ui-monospace, monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(title, W/2, y + 56);
+
+    ctx.fillStyle = COL.uiMuted;
+    ctx.font = "15px ui-monospace, monospace";
+    const startY = y + 110;
+    for (let i=0; i<lines.length; i++) {
+      ctx.fillText(lines[i], W/2, startY + i*22);
+    }
+    ctx.restore();
+  }
+
+  function update(dt) {
+    if (!started || paused || gameOver) return;
+
+    // Difficulty ramp
+    pressure = 1 + Math.floor(score / 520) + Math.floor((performance.now()/1000) / 40);
+    pressure = clamp(pressure, 1, 8);
+
+    // Player move
+    let dir = 0;
+    if (keys.has("arrowleft") || keys.has("a")) dir -= 1;
+    if (keys.has("arrowright") || keys.has("d")) dir += 1;
+    player.x += dir * player.speed * dt;
+    player.x = clamp(player.x, 24, W - 24);
+
+    // Fire
+    player.cooldown -= dt;
+    if (keys.has("space") && player.cooldown <= 0) {
+      bullets.push({ x: player.x, y: player.y - 16, vx: 0, vy: -780, r: 3 });
+      player.cooldown = 0.13;
+      beep(920, 0.03, 0.03, "square");
+    }
+
+    // Bullets update
+    for (let i=bullets.length-1; i>=0; i--) {
+      const b = bullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      if (b.y < -30) bullets.splice(i,1);
+    }
+
+    // Spider spawn logic
+    spider.spawnTimer += dt;
+    if (!spider.active && spider.spawnTimer >= spider.nextSpawnIn) {
+      spider.spawnTimer = 0;
+      spider.nextSpawnIn = rand(4.0, 8.0);
+      spawnSpider();
+    }
+
+    // Spider movement and bounces
+    if (spider.active) {
+      const chaos = 40; // slight wander
+      spider.vx += rand(-chaos, chaos) * dt;
+      spider.vy += rand(-chaos, chaos) * dt;
+
+      // clamp speed so it stays controllable
+      const spd = Math.hypot(spider.vx, spider.vy);
+      const minS = 180, maxS = 420 + pressure*20;
+      if (spd < minS) {
+        const k = minS / Math.max(1, spd);
+        spider.vx *= k; spider.vy *= k;
+      } else if (spd > maxS) {
+        const k = maxS / spd;
+        spider.vx *= k; spider.vy *= k;
+      }
+
+      spider.x += spider.vx * dt;
+      spider.y += spider.vy * dt;
+
+      // bounds within playfield area
+      const left = 30, right = W-30;
+      const top = topMargin + 50, bottom = H - 110;
+
+      if (spider.x < left) { spider.x = left; spider.vx *= -1; beep(220, 0.02, 0.015, "triangle"); }
+      if (spider.x > right) { spider.x = right; spider.vx *= -1; beep(220, 0.02, 0.015, "triangle"); }
+      if (spider.y < top) { spider.y = top; spider.vy *= -1; beep(220, 0.02, 0.015, "triangle"); }
+      if (spider.y > bottom) { spider.y = bottom; spider.vy *= -1; beep(220, 0.02, 0.015, "triangle"); }
+
+      // collision with player ends run
+      if (rectHit(player.x - player.w/2, player.y - player.h/2, player.w, player.h,
+                  spider.x - spider.r, spider.y - spider.r, spider.r*2, spider.r*2)) {
+        gameOver = true;
+        beep(110, 0.12, 0.06, "square");
+      }
+    }
+
+    // Convoy stepping (grid-ish)
+    convoyStepTimer += dt;
+    const stepEvery = clamp(0.22 - pressure*0.016, 0.10, 0.22);
+    if (convoyStepTimer >= stepEvery) {
+      convoyStepTimer = 0;
+
+      const head = convoy[0];
+      const nextX = head.x + convoyDir*laneSize;
+
+      const wouldWall = nextX < laneSize || nextX > W - laneSize;
+      const wouldHome = nearestHomeAtGrid(nextX, head.y);
+
+      if (wouldWall || wouldHome) {
+        convoyDir *= -1;
+        for (const seg of convoy) seg.y += laneSize;
+        beep(200, 0.04, 0.02, "sawtooth");
+
+        if (convoy.some(s => s.y > H - 120)) {
+          gameOver = true;
+          beep(110, 0.12, 0.06, "square");
+        }
+      } else {
+        const prev = convoy.map(s => ({x:s.x, y:s.y}));
+        convoy[0].x = nextX;
+        for (let i=1; i<convoy.length; i++) {
+          convoy[i].x = prev[i-1].x;
+          convoy[i].y = prev[i-1].y;
+        }
+      }
+
+      // Convoy damages homes it occupies (still drives displacement)
+      for (const seg of convoy) {
+        const h = nearestHomeAtGrid(seg.x, seg.y);
+        if (h) {
+          h.hp -= 1;
+          addParticles(h.x, h.y, 8, COL.danger);
+          beep(150, 0.03, 0.02, "square");
+          if (h.hp <= 0) {
+            displacement += 1;
+            const idx = homes.indexOf(h);
+            if (idx >= 0) homes.splice(idx,1);
+            addParticles(h.x, h.y, 20, COL.danger);
+            beep(90, 0.07, 0.05, "square");
+          }
+        }
+      }
+    }
+
+    // Bullet collisions
+    for (let bi=bullets.length-1; bi>=0; bi--) {
+      const b = bullets[bi];
+      let hit = false;
+
+      // Hit home: 3 hits to clear
+      for (let hi=0; hi<homes.length; hi++) {
+        const h = homes[hi];
+        const hx = h.x - homeSize/2, hy = h.y - homeSize/2;
+        if (rectHit(b.x-2,b.y-2,4,4, hx,hy,homeSize,homeSize)) {
+          h.hp -= 1;
+          score += 10;
+          addParticles(h.x, h.y, 10, "rgba(255,255,255,0.75)");
+          beep(520, 0.03, 0.02, "triangle");
+          if (h.hp <= 0) {
+            homes.splice(hi,1);
+            addParticles(h.x, h.y, 18, "rgba(255,255,255,0.9)");
+            beep(660, 0.04, 0.03, "square");
+          }
+          hit = true;
+          break;
+        }
+      }
+      if (hit) { bullets.splice(bi,1); continue; }
+
+      // Hit spider
+      if (spider.active) {
+        if (rectHit(b.x-3,b.y-3,6,6, spider.x-spider.r, spider.y-spider.r, spider.r*2, spider.r*2)) {
+          score += 120;
+          addParticles(spider.x, spider.y, 26, "rgba(255,255,255,0.95)");
+          beep(780, 0.06, 0.04, "square");
+          spider.active = false;
+          spider.spawnTimer = 0;
+          spider.nextSpawnIn = rand(3.0, 6.0);
+          bullets.splice(bi,1);
+          continue;
+        }
+      }
+
+      // Hit convoy segment
+      for (let si=0; si<convoy.length; si++) {
+        const s = convoy[si];
+        const sx = s.x - laneSize/2 + 2;
+        const sy = s.y - laneSize/2 + 2;
+        const sw = laneSize - 4, sh = laneSize - 4;
+        if (rectHit(b.x-2,b.y-2,4,4, sx,sy,sw,sh)) {
+          score += s.head ? 40 : 25;
+          addParticles(s.x, s.y, 14, "rgba(255,255,255,0.85)");
+          beep(s.head ? 720 : 560, 0.04, 0.03, "square");
+
+          const removed = convoy.splice(si,1)[0];
+
+          // When a segment is removed, it leaves behind a new house obstacle (like classic Centipede)
+          homes.push({ x: removed.x, y: removed.y, hp: HOME_HP_MAX });
+
+          if (si === 0 && convoy.length) convoy[0].head = true;
+
+          if (convoy.length === 0) {
+            const newLen = clamp(12 + Math.floor(score/320), 12, 22);
+            spawnConvoy(newLen);
+            beep(980, 0.08, 0.04, "square");
+          }
+
+          hit = true;
+          break;
+        }
+      }
+
+      if (hit) bullets.splice(bi,1);
+    }
+
+    // Particles
+    for (let i=particles.length-1; i>=0; i--) {
+      const p = particles[i];
+      p.t += dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 520 * dt;
+      if (p.t >= p.life) particles.splice(i,1);
+    }
+
+    // Passive score for survival
+    score += dt * (8 + pressure*2);
+  }
+
+  function draw() {
+    // Background
+    ctx.imageSmoothingEnabled = true;
+    ctx.clearRect(0,0,W,H);
+    if (bgCanvas) ctx.drawImage(bgCanvas, 0, 0);
+
+    // Subtle playfield wash to increase readability
+    ctx.fillStyle = "rgba(0,0,0,0.10)";
+    ctx.fillRect(0, topMargin, W, H - topMargin - bottomMargin);
+
+    // HUD bands
+    ctx.fillStyle = COL.panel;
+    ctx.fillRect(0,0,W,56);
+    ctx.fillRect(0,H-56,W,56);
+
+    // HUD text
+    ctx.fillStyle = COL.ui;
+    ctx.font = "16px ui-monospace, monospace";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Right of Way", 16, 28);
+
+    ctx.fillStyle = COL.uiMuted;
+    ctx.font = "14px ui-monospace, monospace";
+    ctx.fillText("Mutual Aid: " + Math.floor(score), 210, 28);
+    ctx.fillText("Displacement: " + displacement, 390, 28);
+    ctx.fillText("Pressure: " + pressure, 570, 28);
+    ctx.fillText(muted ? "MUTED" : "SOUND", W-110, 28);
+
+    // Houses
+    for (const h of homes) drawHouse(h);
+
+    // Convoy
+    for (const s of convoy) {
+      const flip = convoyDir < 0;
+      drawDozer(s, flip);
+    }
+
+    // Spider
+    drawSpider();
+
+    // Player
+    drawPlayer();
+
+    // Bullets
+    ctx.fillStyle = COL.bullet;
+    for (const b of bullets) {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillRect(b.x-1, b.y+6, 2, 3);
+    }
+
+    // Particles
+    for (const p of particles) {
+      const a = 1 - (p.t / p.life);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    if (!started) {
+      overlayBox(
+        "RIGHT OF WAY",
+        [
+          "Arcade prototype about displacement pressure inside a city.",
+          "",
+          "Shoot houses 3 times to clear paths upward.",
+          "Spider bounces randomly. Touching it ends the run.",
+          "",
+          "Press SPACE to start."
+        ]
+      );
+    } else if (paused) {
+      overlayBox("PAUSED", ["Press P to resume."]);
+    } else if (gameOver) {
+      overlayBox(
+        "OVERRUN",
+        [
+          "Pressure reached the last line, or the spider got you.",
+          "",
+          "Mutual Aid: " + Math.floor(score),
+          "Displacement: " + displacement,
+          "",
+          "Press R to restart."
+        ]
+      );
+    }
+  }
+
+  function frame(ts) {
+    const dt = clamp((ts - last) / 1000, 0, 0.033);
+    last = ts;
+
+    if (!started && keys.has("space")) {
+      started = true;
+      beep(660, 0.06, 0.05, "square");
+      keys.delete("space");
+    }
+
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  reset();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
